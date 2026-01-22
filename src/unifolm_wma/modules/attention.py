@@ -125,7 +125,7 @@ class CrossAttention(nn.Module):
         context = default(context, x)
 
         if self.image_cross_attention and not spatial_self_attn:
-            assert 1 > 2, ">>> ERROR: should setup xformers and use efficient_forward ..."
+            # assert 1 > 2, ">>> ERROR: should setup xformers and use efficient_forward ..."
             context_agent_state = context[:, :self.agent_state_context_len, :]
             context_agent_action = context[:,
                                            self.agent_state_context_len:self.
@@ -154,67 +154,71 @@ class CrossAttention(nn.Module):
             k = self.to_k(context)
             v = self.to_v(context)
 
-        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> (b h) n d', h=h),
-                      (q, k, v))
+        # Reshape for SDPA: b n (h d) -> b h n d
+        q = rearrange(q, 'b n (h d) -> b h n d', h=h)
+        k = rearrange(k, 'b n (h d) -> b h n d', h=h)
+        v = rearrange(v, 'b n (h d) -> b h n d', h=h)
 
-        sim = torch.einsum('b i d, b j d -> b i j', q, k) * self.scale
-        if self.relative_position:
-            len_q, len_k, len_v = q.shape[1], k.shape[1], v.shape[1]
-            k2 = self.relative_position_k(len_q, len_k)
-            sim2 = einsum('b t d, t s d -> b t s', q,
-                          k2) * self.scale  # TODO check
-            sim += sim2
-        del k
-
+        # Prepare mask for SDPA if needed
+        attn_mask = None
         if exists(mask):
-            ## feasible for causal attention mask only
-            max_neg_value = -torch.finfo(sim.dtype).max
-            mask = repeat(mask, 'b i j -> (b h) i j', h=h)
-            sim.masked_fill_(~(mask > 0.5), max_neg_value)
+            attn_mask = repeat(mask, 'b i j -> b h i j', h=h)
+            attn_mask = attn_mask > 0.5
 
-        # attention, what we cannot get enough of
-        sim = sim.softmax(dim=-1)
-
-        out = torch.einsum('b i j, b j d -> b i d', sim, v)
+        # Use SDPA (handles relative position separately)
         if self.relative_position:
+            # Fallback to manual for relative position
+            q_m = rearrange(q, 'b h n d -> (b h) n d')
+            k_m = rearrange(k, 'b h n d -> (b h) n d')
+            v_m = rearrange(v, 'b h n d -> (b h) n d')
+            len_q, len_k, len_v = q_m.shape[1], k_m.shape[1], v_m.shape[1]
+            sim = torch.einsum('b i d, b j d -> b i j', q_m, k_m) * self.scale
+            k2 = self.relative_position_k(len_q, len_k)
+            sim2 = einsum('b t d, t s d -> b t s', q_m, k2) * self.scale
+            sim += sim2
+            if attn_mask is not None:
+                max_neg_value = -torch.finfo(sim.dtype).max
+                attn_mask_m = rearrange(attn_mask, 'b h i j -> (b h) i j')
+                sim.masked_fill_(~attn_mask_m, max_neg_value)
+            sim = sim.softmax(dim=-1)
+            out = torch.einsum('b i j, b j d -> b i d', sim, v_m)
             v2 = self.relative_position_v(len_q, len_v)
-            out2 = einsum('b t s, t s d -> b t d', sim, v2)  # TODO check
+            out2 = einsum('b t s, t s d -> b t d', sim, v2)
             out += out2
-        out = rearrange(out, '(b h) n d -> b n (h d)', h=h)
+            out = rearrange(out, '(b h) n d -> b n (h d)', h=h)
+        else:
+            # Use optimized SDPA
+            out = F.scaled_dot_product_attention(
+                q, k, v, attn_mask=attn_mask, dropout_p=0.0, 
+                is_causal=False, scale=self.scale
+            )
+            out = rearrange(out, 'b h n d -> b n (h d)')
 
         if k_ip is not None and k_as is not None and k_aa is not None:
-            ## for image cross-attention
-            k_ip, v_ip = map(
-                lambda t: rearrange(t, 'b n (h d) -> (b h) n d', h=h),
-                (k_ip, v_ip))
-            sim_ip = torch.einsum('b i d, b j d -> b i j', q,
-                                  k_ip) * self.scale
-            del k_ip
-            sim_ip = sim_ip.softmax(dim=-1)
-            out_ip = torch.einsum('b i j, b j d -> b i d', sim_ip, v_ip)
-            out_ip = rearrange(out_ip, '(b h) n d -> b n (h d)', h=h)
+            ## Use SDPA for cross-attentions
+            k_ip = rearrange(k_ip, 'b n (h d) -> b h n d', h=h)
+            v_ip = rearrange(v_ip, 'b n (h d) -> b h n d', h=h)
+            out_ip = F.scaled_dot_product_attention(
+                q, k_ip, v_ip, attn_mask=None, dropout_p=0.0,
+                is_causal=False, scale=self.scale
+            )
+            out_ip = rearrange(out_ip, 'b h n d -> b n (h d)')
 
-            ## for agent state cross-attention
-            k_as, v_as = map(
-                lambda t: rearrange(t, 'b n (h d) -> (b h) n d', h=h),
-                (k_as, v_as))
-            sim_as = torch.einsum('b i d, b j d -> b i j', q,
-                                  k_as) * self.scale
-            del k_as
-            sim_as = sim_as.softmax(dim=-1)
-            out_as = torch.einsum('b i j, b j d -> b i d', sim_as, v_as)
-            out_as = rearrange(out_as, '(b h) n d -> b n (h d)', h=h)
+            k_as = rearrange(k_as, 'b n (h d) -> b h n d', h=h)
+            v_as = rearrange(v_as, 'b n (h d) -> b h n d', h=h)
+            out_as = F.scaled_dot_product_attention(
+                q, k_as, v_as, attn_mask=None, dropout_p=0.0,
+                is_causal=False, scale=self.scale
+            )
+            out_as = rearrange(out_as, 'b h n d -> b n (h d)')
 
-            ## for agent action cross-attention
-            k_aa, v_aa = map(
-                lambda t: rearrange(t, 'b n (h d) -> (b h) n d', h=h),
-                (k_aa, v_aa))
-            sim_aa = torch.einsum('b i d, b j d -> b i j', q,
-                                  k_aa) * self.scale
-            del k_aa
-            sim_aa = sim_aa.softmax(dim=-1)
-            out_aa = torch.einsum('b i j, b j d -> b i d', sim_aa, v_aa)
-            out_aa = rearrange(out_aa, '(b h) n d -> b n (h d)', h=h)
+            k_aa = rearrange(k_aa, 'b n (h d) -> b h n d', h=h)
+            v_aa = rearrange(v_aa, 'b n (h d) -> b h n d', h=h)
+            out_aa = F.scaled_dot_product_attention(
+                q, k_aa, v_aa, attn_mask=None, dropout_p=0.0,
+                is_causal=False, scale=self.scale
+            )
+            out_aa = rearrange(out_aa, 'b h n d -> b n (h d)')
 
         if out_ip is not None and out_as is not None and out_aa is not None:
             if self.cross_attention_scale_learnable:
