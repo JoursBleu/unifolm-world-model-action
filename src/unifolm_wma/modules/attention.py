@@ -1,4 +1,5 @@
 import torch
+import time
 import torch.nn.functional as F
 
 from torch import nn, einsum
@@ -11,6 +12,35 @@ try:
     XFORMERS_IS_AVAILBLE = True
 except:
     XFORMERS_IS_AVAILBLE = False
+
+# ===== Op-level timing helpers =====
+def _sync_device_op():
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+def _time_start_op():
+    _sync_device_op()
+    return time.time()
+
+def _time_end_op(start):
+    _sync_device_op()
+    return time.time() - start
+
+# Op timing accumulators
+_OP_TIMES = {
+    'spatial_norm': 0.0, 'spatial_proj_in': 0.0, 'spatial_attn_blocks': 0.0, 'spatial_proj_out': 0.0,
+    'temporal_norm': 0.0, 'temporal_proj_in': 0.0, 'temporal_attn_blocks': 0.0, 'temporal_proj_out': 0.0,
+}
+_OP_COUNTS = {k: 0 for k in _OP_TIMES}
+
+def _reset_op_times():
+    global _OP_TIMES, _OP_COUNTS
+    _OP_TIMES = {k: 0.0 for k in _OP_TIMES}
+    _OP_COUNTS = {k: 0 for k in _OP_COUNTS}
+
+def _get_op_times():
+    return _OP_TIMES, _OP_COUNTS
+# ===== End op-level timing helpers =====
 
 from unifolm_wma.utils.common import (
     checkpoint,
@@ -115,12 +145,18 @@ class CrossAttention(nn.Module):
                                         nn.Parameter(torch.tensor(0.)))
 
     def forward(self, x, context=None, mask=None):
+        # CrossAttention op timing
+        if not hasattr(CrossAttention, '_op_times'):
+            CrossAttention._op_times = {'to_qkv': 0.0, 'sdpa': 0.0, 'to_out': 0.0}
+            CrossAttention._op_counts = {k: 0 for k in CrossAttention._op_times}
+        
         spatial_self_attn = (context is None)
         k_ip, v_ip, out_ip = None, None, None
         k_as, v_as, out_as = None, None, None
         k_aa, v_aa, out_aa = None, None, None
 
         h = self.heads
+        _t0 = _time_start_op()
         q = self.to_q(x)
         context = default(context, x)
 
@@ -154,7 +190,11 @@ class CrossAttention(nn.Module):
             k = self.to_k(context)
             v = self.to_v(context)
 
+        CrossAttention._op_times['to_qkv'] += _time_end_op(_t0)
+        CrossAttention._op_counts['to_qkv'] += 1
+        
         # Reshape for SDPA: b n (h d) -> b h n d
+        _t0 = _time_start_op()
         q = rearrange(q, 'b n (h d) -> b h n d', h=h)
         k = rearrange(k, 'b n (h d) -> b h n d', h=h)
         v = rearrange(v, 'b n (h d) -> b h n d', h=h)
@@ -220,6 +260,9 @@ class CrossAttention(nn.Module):
             )
             out_aa = rearrange(out_aa, 'b h n d -> b n (h d)')
 
+        CrossAttention._op_times['sdpa'] += _time_end_op(_t0)
+        CrossAttention._op_counts['sdpa'] += 1
+        
         if out_ip is not None and out_as is not None and out_aa is not None:
             if self.cross_attention_scale_learnable:
                 out = out + \
@@ -232,7 +275,11 @@ class CrossAttention(nn.Module):
                     self.agent_state_cross_attention_scale * out_as + \
                     self.agent_action_cross_attention_scale * out_aa
 
-        return self.to_out(out)
+        _t0 = _time_start_op()
+        result = self.to_out(out)
+        CrossAttention._op_times['to_out'] += _time_end_op(_t0)
+        CrossAttention._op_counts['to_out'] += 1
+        return result
 
     def efficient_forward(self, x, context=None, mask=None):
         spatial_self_attn = (context is None)
@@ -465,11 +512,28 @@ class BasicTransformerBlock(nn.Module):
                           self.checkpoint)
 
     def _forward(self, x, context=None, mask=None):
+        # BasicTransformerBlock op timing
+        if not hasattr(BasicTransformerBlock, '_op_times'):
+            BasicTransformerBlock._op_times = {'self_attn': 0.0, 'cross_attn': 0.0, 'ff': 0.0}
+            BasicTransformerBlock._op_counts = {k: 0 for k in BasicTransformerBlock._op_times}
+        
+        _t0 = _time_start_op()
         x = self.attn1(self.norm1(x),
                        context=context if self.disable_self_attn else None,
                        mask=mask) + x
+        BasicTransformerBlock._op_times['self_attn'] += _time_end_op(_t0)
+        BasicTransformerBlock._op_counts['self_attn'] += 1
+        
+        _t0 = _time_start_op()
         x = self.attn2(self.norm2(x), context=context, mask=mask) + x
+        BasicTransformerBlock._op_times['cross_attn'] += _time_end_op(_t0)
+        BasicTransformerBlock._op_counts['cross_attn'] += 1
+        
+        _t0 = _time_start_op()
         x = self.ff(self.norm3(x)) + x
+        BasicTransformerBlock._op_times['ff'] += _time_end_op(_t0)
+        BasicTransformerBlock._op_counts['ff'] += 1
+        
         return x
 
 
@@ -546,19 +610,35 @@ class SpatialTransformer(nn.Module):
     def forward(self, x, context=None, **kwargs):
         b, c, h, w = x.shape
         x_in = x
+        # Op timing: norm
+        _t0 = _time_start_op()
         x = self.norm(x)
+        _OP_TIMES['spatial_norm'] += _time_end_op(_t0)
+        _OP_COUNTS['spatial_norm'] += 1
+        # Op timing: proj_in
+        _t0 = _time_start_op()
         if not self.use_linear:
             x = self.proj_in(x)
         x = rearrange(x, 'b c h w -> b (h w) c').contiguous()
         if self.use_linear:
             x = self.proj_in(x)
+        _OP_TIMES['spatial_proj_in'] += _time_end_op(_t0)
+        _OP_COUNTS['spatial_proj_in'] += 1
+        # Op timing: attn_blocks
+        _t0 = _time_start_op()
         for i, block in enumerate(self.transformer_blocks):
             x = block(x, context=context, **kwargs)
+        _OP_TIMES['spatial_attn_blocks'] += _time_end_op(_t0)
+        _OP_COUNTS['spatial_attn_blocks'] += 1
+        # Op timing: proj_out
+        _t0 = _time_start_op()
         if self.use_linear:
             x = self.proj_out(x)
         x = rearrange(x, 'b (h w) c -> b c h w', h=h, w=w).contiguous()
         if not self.use_linear:
             x = self.proj_out(x)
+        _OP_TIMES['spatial_proj_out'] += _time_end_op(_t0)
+        _OP_COUNTS['spatial_proj_out'] += 1
         return x + x_in
 
 
@@ -649,13 +729,21 @@ class TemporalTransformer(nn.Module):
     def forward(self, x, context=None):
         b, c, t, h, w = x.shape
         x_in = x
+        # Op timing: norm
+        _t0 = _time_start_op()
         x = self.norm(x)
+        _OP_TIMES['temporal_norm'] += _time_end_op(_t0)
+        _OP_COUNTS['temporal_norm'] += 1
+        # Op timing: proj_in
+        _t0 = _time_start_op()
         x = rearrange(x, 'b c t h w -> (b h w) c t').contiguous()
         if not self.use_linear:
             x = self.proj_in(x)
         x = rearrange(x, 'bhw c t -> bhw t c').contiguous()
         if self.use_linear:
             x = self.proj_in(x)
+        _OP_TIMES['temporal_proj_in'] += _time_end_op(_t0)
+        _OP_COUNTS['temporal_proj_in'] += 1
 
         temp_mask = None
         if self.causal_attention:
@@ -668,6 +756,8 @@ class TemporalTransformer(nn.Module):
         else:
             mask = None
 
+        # Op timing: attn_blocks
+        _t0 = _time_start_op()
         if self.only_self_att:
             # NOTE: if no context is given, cross-attention defaults to self-attention
             for i, block in enumerate(self.transformer_blocks):
@@ -687,6 +777,10 @@ class TemporalTransformer(nn.Module):
                     # Note: causal mask will not applied in cross-attention case
                     x[j] = block(x[j], context=context_j)
 
+        _OP_TIMES['temporal_attn_blocks'] += _time_end_op(_t0)
+        _OP_COUNTS['temporal_attn_blocks'] += 1
+        # Op timing: proj_out
+        _t0 = _time_start_op()
         if self.use_linear:
             x = self.proj_out(x)
             x = rearrange(x, 'b (h w) t c -> b c t h w', h=h, w=w).contiguous()
@@ -695,6 +789,8 @@ class TemporalTransformer(nn.Module):
             x = self.proj_out(x)
             x = rearrange(x, '(b h w) c t -> b c t h w', b=b, h=h,
                           w=w).contiguous()
+        _OP_TIMES['temporal_proj_out'] += _time_end_op(_t0)
+        _OP_COUNTS['temporal_proj_out'] += 1
 
         return x + x_in
 
@@ -723,7 +819,23 @@ class FeedForward(nn.Module):
                                  nn.Linear(inner_dim, dim_out))
 
     def forward(self, x):
-        return self.net(x)
+        # FeedForward op timing
+        if not hasattr(FeedForward, '_op_times'):
+            FeedForward._op_times = {'geglu': 0.0, 'linear_out': 0.0}
+            FeedForward._op_counts = {k: 0 for k in FeedForward._op_times}
+        
+        _t0 = _time_start_op()
+        x = self.net[0](x)  # project_in (GEGLU or Linear+GELU)
+        FeedForward._op_times['geglu'] += _time_end_op(_t0)
+        FeedForward._op_counts['geglu'] += 1
+        
+        _t0 = _time_start_op()
+        x = self.net[1](x)  # Dropout
+        x = self.net[2](x)  # Linear out
+        FeedForward._op_times['linear_out'] += _time_end_op(_t0)
+        FeedForward._op_counts['linear_out'] += 1
+        
+        return x
 
 
 class LinearAttention(nn.Module):

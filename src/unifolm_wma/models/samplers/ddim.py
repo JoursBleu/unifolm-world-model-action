@@ -1,11 +1,35 @@
 import numpy as np
 import torch
 import copy
+import time
 
 from unifolm_wma.utils.diffusion import make_ddim_sampling_parameters, make_ddim_timesteps, rescale_noise_cfg
 from unifolm_wma.utils.common import noise_like
 from unifolm_wma.utils.common import extract_into_tensor
 from tqdm import tqdm
+
+
+def _sync_device(device: torch.device | None) -> None:
+    if device is None:
+        return
+    if torch.cuda.is_available() and device.type == 'cuda':
+        torch.cuda.synchronize(device)
+
+
+def _time_start(device: torch.device | None) -> float:
+    _sync_device(device)
+    return time.time()
+
+
+def _time_end(device: torch.device | None, label: str, start_time: float) -> None:
+    _sync_device(device)
+    elapsed = time.time() - start_time
+    print(f'[TIME] {label}: {elapsed:.4f}s')
+
+
+def _time_elapsed(device: torch.device | None, start_time: float) -> float:
+    _sync_device(device)
+    return time.time() - start_time
 
 
 class DDIMSampler(object):
@@ -127,6 +151,7 @@ class DDIMSampler(object):
                         f"Warning: Got {conditioning.shape[0]} conditionings but batch-size is {batch_size}"
                     )
 
+        device = self.model.device
         self.make_schedule(ddim_num_steps=S,
                            ddim_discretize=timestep_spacing,
                            ddim_eta=eta,
@@ -238,6 +263,7 @@ class DDIMSampler(object):
             iterator = time_range
 
         clean_cond = kwargs.pop("clean_cond", False)
+        scheduler_total = 0.0
 
         dp_ddim_scheduler_action.set_timesteps(len(timesteps))
         dp_ddim_scheduler_state.set_timesteps(len(timesteps))
@@ -277,6 +303,7 @@ class DDIMSampler(object):
 
             img, pred_x0, model_output_action, model_output_state = outs
 
+            t_sched = _time_start(device)
             action = dp_ddim_scheduler_action.step(
                 model_output_action,
                 step,
@@ -289,6 +316,7 @@ class DDIMSampler(object):
                 state,
                 generator=None,
             ).prev_sample
+            scheduler_total += _time_elapsed(device, t_sched)
 
             if callback: callback(i)
             if img_callback: img_callback(pred_x0, i)
@@ -299,6 +327,7 @@ class DDIMSampler(object):
                 intermediates['x_inter_action'].append(action)
                 intermediates['x_inter_state'].append(state)
 
+        print(f"[TIME] wma/ddim_sample/scheduler_total: {scheduler_total:.4f}s")
         return img, action, state, intermediates
 
     @torch.no_grad()
@@ -330,6 +359,7 @@ class DDIMSampler(object):
         else:
             is_video = False
 
+        t_apply = _time_start(device)
         if unconditional_conditioning is None or unconditional_guidance_scale == 1.:
             model_output, model_output_action, model_output_state = self.model.apply_model(
                 x, x_action, x_state, t, c, **kwargs)  # unet denoiser
@@ -361,7 +391,9 @@ class DDIMSampler(object):
                     model_output_state,
                     e_t_cond_state,
                     guidance_rescale=guidance_rescale)
+        self._apply_model_elapsed = _time_elapsed(device, t_apply)
 
+        t_post = _time_start(device)
         if self.model.parameterization == "v":
             e_t = self.model.predict_eps_from_z_and_v(x, t, model_output)
         else:
@@ -415,6 +447,7 @@ class DDIMSampler(object):
             noise = torch.nn.functional.dropout(noise, p=noise_dropout)
 
         x_prev = a_prev.sqrt() * pred_x0 + dir_xt + noise
+        self._post_process_elapsed = _time_elapsed(device, t_post)
 
         return x_prev, pred_x0, model_output_action, model_output_state
 

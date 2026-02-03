@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import time
 import torch.nn.functional as F
 
 from torch import Tensor
@@ -14,9 +15,24 @@ from unifolm_wma.utils.diffusion import timestep_embedding
 from unifolm_wma.utils.common import checkpoint
 from unifolm_wma.utils.basics import (zero_module, conv_nd, linear,
                                       avg_pool_nd, normalization)
-from unifolm_wma.modules.attention import SpatialTransformer, TemporalTransformer
+from unifolm_wma.modules.attention import SpatialTransformer, TemporalTransformer, BasicTransformerBlock, CrossAttention, FeedForward, CrossAttention, FeedForward, BasicTransformerBlock
 from unifolm_wma.utils.utils import instantiate_from_config
 
+
+
+# ===== Timing helpers for profiling =====
+def _sync_device():
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+def _time_start():
+    _sync_device()
+    return time.time()
+
+def _time_end(start):
+    _sync_device()
+    return time.time() - start
+# ===== End timing helpers =====
 
 class TimestepBlock(nn.Module):
     """
@@ -37,17 +53,31 @@ class TimestepEmbedSequential(nn.Sequential, TimestepBlock):
     """
 
     def forward(self, x, emb, context=None, batch_size=None):
+        # Layer timing accumulators (class-level)
+        if not hasattr(TimestepEmbedSequential, '_layer_times'):
+            TimestepEmbedSequential._layer_times = {'resblock': 0.0, 'spatial_attn': 0.0, 'temporal_attn': 0.0, 'other': 0.0}
+            TimestepEmbedSequential._layer_counts = {'resblock': 0, 'spatial_attn': 0, 'temporal_attn': 0, 'other': 0}
+        
         for layer in self:
+            _layer_start = _time_start()
             if isinstance(layer, TimestepBlock):
                 x = layer(x, emb, batch_size=batch_size)
+                TimestepEmbedSequential._layer_times['resblock'] += _time_end(_layer_start)
+                TimestepEmbedSequential._layer_counts['resblock'] += 1
             elif isinstance(layer, SpatialTransformer):
                 x = layer(x, context)
+                TimestepEmbedSequential._layer_times['spatial_attn'] += _time_end(_layer_start)
+                TimestepEmbedSequential._layer_counts['spatial_attn'] += 1
             elif isinstance(layer, TemporalTransformer):
                 x = rearrange(x, '(b f) c h w -> b c f h w', b=batch_size)
                 x = layer(x, context)
                 x = rearrange(x, 'b c f h w -> (b f) c h w')
+                TimestepEmbedSequential._layer_times['temporal_attn'] += _time_end(_layer_start)
+                TimestepEmbedSequential._layer_counts['temporal_attn'] += 1
             else:
                 x = layer(x)
+                TimestepEmbedSequential._layer_times['other'] += _time_end(_layer_start)
+                TimestepEmbedSequential._layer_counts['other'] += 1
         return x
 
 
@@ -235,6 +265,12 @@ class ResBlock(TimestepBlock):
                           self.use_checkpoint)
 
     def _forward(self, x, emb, batch_size=None):
+        # ResBlock op timing
+        if not hasattr(ResBlock, '_op_times'):
+            ResBlock._op_times = {'in_layers': 0.0, 'emb_layers': 0.0, 'out_layers': 0.0, 'skip_conn': 0.0, 'temporal_conv': 0.0}
+            ResBlock._op_counts = {k: 0 for k in ResBlock._op_times}
+        
+        _t0 = _time_start()
         if self.updown:
             in_rest, in_conv = self.in_layers[:-1], self.in_layers[-1]
             h = in_rest(x)
@@ -243,9 +279,17 @@ class ResBlock(TimestepBlock):
             h = in_conv(h)
         else:
             h = self.in_layers(x)
+        ResBlock._op_times['in_layers'] += _time_end(_t0)
+        ResBlock._op_counts['in_layers'] += 1
+        
+        _t0 = _time_start()
         emb_out = self.emb_layers(emb).type(h.dtype)
         while len(emb_out.shape) < len(h.shape):
             emb_out = emb_out[..., None]
+        ResBlock._op_times['emb_layers'] += _time_end(_t0)
+        ResBlock._op_counts['emb_layers'] += 1
+        
+        _t0 = _time_start()
         if self.use_scale_shift_norm:
             out_norm, out_rest = self.out_layers[0], self.out_layers[1:]
             scale, shift = torch.chunk(emb_out, 2, dim=1)
@@ -254,12 +298,21 @@ class ResBlock(TimestepBlock):
         else:
             h = h + emb_out
             h = self.out_layers(h)
+        ResBlock._op_times['out_layers'] += _time_end(_t0)
+        ResBlock._op_counts['out_layers'] += 1
+        
+        _t0 = _time_start()
         h = self.skip_connection(x) + h
+        ResBlock._op_times['skip_conn'] += _time_end(_t0)
+        ResBlock._op_counts['skip_conn'] += 1
 
         if self.use_temporal_conv and batch_size:
+            _t0 = _time_start()
             h = rearrange(h, '(b t) c h w -> b c t h w', b=batch_size)
             h = self.temopral_conv(h)
             h = rearrange(h, 'b c t h w -> (b t) c h w')
+            ResBlock._op_times['temporal_conv'] += _time_end(_t0)
+            ResBlock._op_counts['temporal_conv'] += 1
         return h
 
 
@@ -791,11 +844,18 @@ class WMAModel(nn.Module):
             fs_embed = fs_embed.repeat_interleave(repeats=t, dim=0)
             emb = emb + fs_embed
 
+        # ===== Timing: video_unet =====
+        _video_unet_start = _time_start()
+        
         h = x.type(self.dtype)
         adapter_idx = 0
         hs = []
         hs_a = []
+        # ===== Timing: input_blocks =====
+        _input_blocks_start = _time_start()
+        _input_block_times = []
         for id, module in enumerate(self.input_blocks):
+            _block_start = _time_start()
             h = module(h, emb, context=context, batch_size=b)
             if id == 0 and self.addition_attention:
                 h = self.init_attn(h, emb, context=context, batch_size=b)
@@ -808,39 +868,109 @@ class WMAModel(nn.Module):
                     hs_a.append(
                         rearrange(hs[-1], '(b t) c h w -> b t c h w', t=t))
             hs.append(h)
+            _input_block_times.append(_time_end(_block_start))
         hs_a.append(rearrange(h, '(b t) c h w -> b t c h w', t=t))
+        _input_blocks_elapsed = _time_end(_input_blocks_start)
+        print(f"[TIMING] wma/ddim_sample/p_sample_ddim/apply_model/video_unet/input_blocks_total: {_input_blocks_elapsed:.4f}s")
+        print(f"[TIMING] wma/.../input_blocks_detail: " + " | ".join([f"b{i}:{t:.3f}s" for i, t in enumerate(_input_block_times)]))
 
         if features_adapter is not None:
             assert len(
                 features_adapter) == adapter_idx, 'Wrong features_adapter'
+        # ===== Timing: middle_block =====
+        _middle_block_start = _time_start()
         h = self.middle_block(h, emb, context=context, batch_size=b)
+        _middle_block_elapsed = _time_end(_middle_block_start)
+        print(f"[TIMING] wma/ddim_sample/p_sample_ddim/apply_model/video_unet/middle_block_total: {_middle_block_elapsed:.4f}s")
         hs_a.append(rearrange(h, '(b t) c h w -> b t c h w', t=t))
 
         hs_out = []
-        for module in self.output_blocks:
+        # ===== Timing: output_blocks =====
+        _output_blocks_start = _time_start()
+        _output_block_times = []
+        for idx, module in enumerate(self.output_blocks):
+            _block_start = _time_start()
             h = torch.cat([h, hs.pop()], dim=1)
             h = module(h, emb, context=context, batch_size=b)
             if isinstance(module[-1], Upsample):
                 hs_a.append(
                     rearrange(hs_out[-1], '(b t) c h w -> b t c h w', t=t))
             hs_out.append(h)
+            _output_block_times.append(_time_end(_block_start))
         h = h.type(x.dtype)
         hs_a.append(rearrange(hs_out[-1], '(b t) c h w -> b t c h w', t=t))
+        _output_blocks_elapsed = _time_end(_output_blocks_start)
+        print(f"[TIMING] wma/ddim_sample/p_sample_ddim/apply_model/video_unet/output_blocks_total: {_output_blocks_elapsed:.4f}s")
+        print(f"[TIMING] wma/.../output_blocks_detail: " + " | ".join([f"b{i}:{t:.3f}s" for i, t in enumerate(_output_block_times)]))
 
+        # ===== Timing: out =====
+        _out_start = _time_start()
         y = self.out(h)
+        _out_elapsed = _time_end(_out_start)
+        print(f"[TIMING] wma/ddim_sample/p_sample_ddim/apply_model/video_unet/out_total: {_out_elapsed:.4f}s")
         y = rearrange(y, '(b t) c h w -> b c t h w', b=b)
+        _video_unet_elapsed = _time_end(_video_unet_start)
+        print(f"[TIMING] wma/ddim_sample/p_sample_ddim/apply_model/video_unet_total: {_video_unet_elapsed:.4f}s")
+        # Print layer type breakdown
+        from unifolm_wma.modules.networks.wma_model import TimestepEmbedSequential
+        if hasattr(TimestepEmbedSequential, '_layer_times'):
+            lt = TimestepEmbedSequential._layer_times
+            lc = TimestepEmbedSequential._layer_counts
+            print(f"[TIMING] wma/.../layer_breakdown: resblock:{lt['resblock']:.3f}s({lc['resblock']}) | spatial_attn:{lt['spatial_attn']:.3f}s({lc['spatial_attn']}) | temporal_attn:{lt['temporal_attn']:.3f}s({lc['temporal_attn']}) | other:{lt['other']:.3f}s({lc['other']})")
+            # Print op-level breakdown
+            from unifolm_wma.modules.attention import _get_op_times, _reset_op_times
+            ot, oc = _get_op_times()
+            print(f"[TIMING] wma/.../op_breakdown_spatial: norm:{ot['spatial_norm']:.3f}s | proj_in:{ot['spatial_proj_in']:.3f}s | attn_blocks:{ot['spatial_attn_blocks']:.3f}s | proj_out:{ot['spatial_proj_out']:.3f}s")
+            # Print ResBlock op breakdown
+            if hasattr(ResBlock, '_op_times'):
+                rt = ResBlock._op_times
+                print(f"[TIMING] wma/.../op_breakdown_resblock: in_layers:{rt['in_layers']:.3f}s | emb_layers:{rt['emb_layers']:.3f}s | out_layers:{rt['out_layers']:.3f}s | skip_conn:{rt['skip_conn']:.3f}s | temporal_conv:{rt['temporal_conv']:.3f}s")
+                ResBlock._op_times = {'in_layers': 0.0, 'emb_layers': 0.0, 'out_layers': 0.0, 'skip_conn': 0.0, 'temporal_conv': 0.0}
+                ResBlock._op_counts = {k: 0 for k in ResBlock._op_times}
+            # Print TemporalTransformer op breakdown
+            print(f"[TIMING] wma/.../op_breakdown_temporal: norm:{ot['temporal_norm']:.3f}s | proj_in:{ot['temporal_proj_in']:.3f}s | attn_blocks:{ot['temporal_attn_blocks']:.3f}s | proj_out:{ot['temporal_proj_out']:.3f}s")
+            # Print BasicTransformerBlock (attn_block) op breakdown
+            if hasattr(BasicTransformerBlock, '_op_times'):
+                bt = BasicTransformerBlock._op_times
+                print(f"[TIMING] wma/.../op_breakdown_attn_block: self_attn:{bt['self_attn']:.3f}s | cross_attn:{bt['cross_attn']:.3f}s | ff:{bt['ff']:.3f}s")
+                BasicTransformerBlock._op_times = {'self_attn': 0.0, 'cross_attn': 0.0, 'ff': 0.0}
+                BasicTransformerBlock._op_counts = {k: 0 for k in BasicTransformerBlock._op_times}
+            # Print CrossAttention op breakdown
+            if hasattr(CrossAttention, '_op_times'):
+                ca = CrossAttention._op_times
+                print(f"[TIMING] wma/.../op_breakdown_cross_attn: to_qkv:{ca['to_qkv']:.3f}s | sdpa:{ca['sdpa']:.3f}s | to_out:{ca['to_out']:.3f}s")
+                CrossAttention._op_times = {'to_qkv': 0.0, 'sdpa': 0.0, 'to_out': 0.0}
+                CrossAttention._op_counts = {k: 0 for k in CrossAttention._op_times}
+            # Print FeedForward op breakdown
+            if hasattr(FeedForward, '_op_times'):
+                ff = FeedForward._op_times
+                print(f"[TIMING] wma/.../op_breakdown_ff: geglu:{ff['geglu']:.3f}s | linear_out:{ff['linear_out']:.3f}s")
+                FeedForward._op_times = {'geglu': 0.0, 'linear_out': 0.0}
+                FeedForward._op_counts = {k: 0 for k in FeedForward._op_times}
+            _reset_op_times()
+            # Reset for next call
+            TimestepEmbedSequential._layer_times = {'resblock': 0.0, 'spatial_attn': 0.0, 'temporal_attn': 0.0, 'other': 0.0}
+            TimestepEmbedSequential._layer_counts = {'resblock': 0, 'spatial_attn': 0, 'temporal_attn': 0, 'other': 0}
 
         if not self.base_model_gen_only:
             ba, _, _ = x_action.shape
+            # ===== Timing: action_unet =====
+            _action_unet_start = _time_start()
             a_y = self.action_unet(x_action, timesteps[:ba], hs_a,
                                    context_action[:2], **kwargs)
+            _action_unet_elapsed = _time_end(_action_unet_start)
+            print(f"[TIMING] wma/ddim_sample/p_sample_ddim/apply_model/action_unet_total: {_action_unet_elapsed:.4f}s")
             # Predict state
+            # ===== Timing: state_unet =====
+            _state_unet_start = _time_start()
             if b > 1:
                 s_y = self.state_unet(x_state, timesteps[:ba], hs_a,
                                       context_action[:2], **kwargs)
             else:
                 s_y = self.state_unet(x_state, timesteps, hs_a,
                                       context_action[:2], **kwargs)
+            _state_unet_elapsed = _time_end(_state_unet_start)
+            print(f"[TIMING] wma/ddim_sample/p_sample_ddim/apply_model/state_unet_total: {_state_unet_elapsed:.4f}s")
         else:
             a_y = torch.zeros_like(x_action)
             s_y = torch.zeros_like(x_state)

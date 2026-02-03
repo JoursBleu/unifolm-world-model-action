@@ -9,6 +9,7 @@ import logging
 import einops
 import warnings
 import imageio
+import time
 
 from pytorch_lightning import seed_everything
 from omegaconf import OmegaConf
@@ -24,6 +25,24 @@ from PIL import Image
 
 from unifolm_wma.models.samplers.ddim import DDIMSampler
 from unifolm_wma.utils.utils import instantiate_from_config
+
+
+def _sync_device(device: torch.device | None) -> None:
+    if device is None:
+        return
+    if torch.cuda.is_available() and device.type == 'cuda':
+        torch.cuda.synchronize(device)
+
+
+def _time_start(device: torch.device | None) -> float:
+    _sync_device(device)
+    return time.time()
+
+
+def _time_end(device: torch.device | None, label: str, start_time: float) -> None:
+    _sync_device(device)
+    elapsed = time.time() - start_time
+    print(f'[TIME] {label}: {elapsed:.4f}s')
 
 
 def get_device_from_parameters(module: nn.Module) -> torch.device:
@@ -361,34 +380,57 @@ def image_guided_synthesis_sim_mode(
     ddim_sampler = DDIMSampler(model)
     batch_size = noise_shape[0]
 
-    fs = torch.tensor([fs] * batch_size, dtype=torch.long, device=model.device)
+    device = model.device
+    t_total = _time_start(device)
 
+    t_fs = _time_start(device)
+    fs = torch.tensor([fs] * batch_size, dtype=torch.long, device=model.device)
+    _time_end(device, "wma/fs_tensor", t_fs)
+
+    t_cond = _time_start(device)
+    t_img_prep = _time_start(device)
     img = observation['observation.images.top'].permute(0, 2, 1, 3, 4)
     cond_img = rearrange(img, 'b o c h w -> (b o) c h w')[-1:]
+    _time_end(device, "wma/cond_img_prep", t_img_prep)
+
+    t_img_emb = _time_start(device)
     cond_img_emb = model.embedder(cond_img)
+    _time_end(device, "wma/cond_img_embedder", t_img_emb)
+
+    t_img_proj = _time_start(device)
     cond_img_emb = model.image_proj_model(cond_img_emb)
+    _time_end(device, "wma/cond_img_proj", t_img_proj)
 
     if model.model.conditioning_key == 'hybrid':
+        t_latent = _time_start(device)
         z = get_latent_z(model, img.permute(0, 2, 1, 3, 4))
         img_cat_cond = z[:, :, -1:, :, :]
         img_cat_cond = repeat(img_cat_cond,
                               'b c t h w -> b c (repeat t) h w',
                               repeat=noise_shape[2])
         cond = {"c_concat": [img_cat_cond]}
+        _time_end(device, "wma/cond_latent_z", t_latent)
 
     if not text_input:
         prompts = [""] * batch_size
+    t_text = _time_start(device)
     cond_ins_emb = model.get_learned_conditioning(prompts)
+    _time_end(device, "wma/cond_text", t_text)
 
+    t_state = _time_start(device)
     cond_state_emb = model.state_projector(observation['observation.state'])
     cond_state_emb = cond_state_emb + model.agent_state_pos_emb
+    _time_end(device, "wma/cond_state", t_state)
 
+    t_action = _time_start(device)
     cond_action_emb = model.action_projector(observation['action'])
     cond_action_emb = cond_action_emb + model.agent_action_pos_emb
+    _time_end(device, "wma/cond_action", t_action)
 
     if not sim_mode:
         cond_action_emb = torch.zeros_like(cond_action_emb)
 
+    t_cond_pack = _time_start(device)
     cond["c_crossattn"] = [
         torch.cat(
             [cond_state_emb, cond_action_emb, cond_ins_emb, cond_img_emb],
@@ -401,12 +443,15 @@ def image_guided_synthesis_sim_mode(
         sim_mode,
         False,
     ]
+    _time_end(device, "wma/cond_pack", t_cond_pack)
 
     uc = None
     kwargs.update({"unconditional_conditioning_img_nonetext": None})
     cond_mask = None
     cond_z0 = None
+    _time_end(device, "wma/cond_build", t_cond)
     if ddim_sampler is not None:
+        t_sample = _time_start(device)
         samples, actions, states, intermedia = ddim_sampler.sample(
             S=ddim_steps,
             conditioning=cond,
@@ -424,10 +469,15 @@ def image_guided_synthesis_sim_mode(
             guidance_rescale=guidance_rescale,
             **kwargs)
 
+        _time_end(device, "wma/ddim_sample", t_sample)
+
         # Reconstruct from latent to pixel space
+        t_decode = _time_start(device)
         batch_images = model.decode_first_stage(samples)
         batch_variants = batch_images
+        _time_end(device, "wma/decode_first_stage", t_decode)
 
+    _time_end(device, "wma/image_guided_total", t_total)
     return batch_variants, actions, states
 
 
@@ -450,10 +500,13 @@ def run_inference(args: argparse.Namespace, gpu_num: int, gpu_no: int) -> None:
     writer = SummaryWriter(log_dir=log_dir)
 
     # Load prompt
+    t_prompts = _time_start(None)
     csv_path = os.path.join(args.prompt_dir, f"{args.dataset}.csv")
     df = pd.read_csv(csv_path)
+    _time_end(None, "wma/load_prompts_csv", t_prompts)
 
     # Load config
+    t_model = _time_start(None)
     config = OmegaConf.load(args.config)
     config['model']['params']['wma_config']['params'][
         'use_checkpoint'] = False
@@ -463,15 +516,20 @@ def run_inference(args: argparse.Namespace, gpu_num: int, gpu_no: int) -> None:
     model = load_model_checkpoint(model, args.ckpt_path)
     model.eval()
     print(f'>>> Load pre-trained model ...')
+    _time_end(None, "wma/load_model", t_model)
 
     # Build unnomalizer
+    t_data = _time_start(None)
     logging.info("***** Configing Data *****")
     data = instantiate_from_config(config.data)
     data.setup()
     print(">>> Dataset is successfully loaded ...")
+    _time_end(None, "wma/data_setup", t_data)
 
+    t_cuda = _time_start(None)
     model = model.cuda(gpu_no)
     device = get_device_from_parameters(model)
+    _time_end(device, "wma/model_to_cuda", t_cuda)
 
     # Run over data
     assert (args.height % 16 == 0) and (
@@ -529,6 +587,7 @@ def run_inference(args: argparse.Namespace, gpu_num: int, gpu_no: int) -> None:
             # Obtain initial frame and state
             start_idx = 0
             model_input_fs = ori_fps // fs
+            t_init = _time_start(device)
             batch, ori_state_dim, ori_action_dim = prepare_init_input(
                 start_idx,
                 init_frame_path,
@@ -551,11 +610,14 @@ def run_inference(args: argparse.Namespace, gpu_num: int, gpu_no: int) -> None:
             }
             # Update observation queues
             cond_obs_queues = populate_queues(cond_obs_queues, observation)
+            _time_end(device, f"wma/init_input/fs{fs}", t_init)
 
             # Multi-round interaction with the world-model
             for itr in tqdm(range(args.n_iter)):
 
+                t_iter = _time_start(device)
                 # Get observation
+                t_obs_policy = _time_start(device)
                 observation = {
                     'observation.images.top':
                     torch.stack(list(
@@ -571,9 +633,11 @@ def run_inference(args: argparse.Namespace, gpu_num: int, gpu_no: int) -> None:
                     key: observation[key].to(device, non_blocking=True)
                     for key in observation
                 }
+                _time_end(device, f"wma/obs_policy/itr{itr}", t_obs_policy)
 
                 # Use world-model in policy to generate action
                 print(f'>>> Step {itr}: generating actions ...')
+                t_action = _time_start(device)
                 pred_videos_0, pred_actions, _ = image_guided_synthesis_sim_mode(
                     model,
                     sample['instruction'],
@@ -588,15 +652,19 @@ def run_inference(args: argparse.Namespace, gpu_num: int, gpu_no: int) -> None:
                     timestep_spacing=args.timestep_spacing,
                     guidance_rescale=args.guidance_rescale,
                     sim_mode=False)
+                _time_end(device, f"wma/action_gen/itr{itr}", t_action)
 
                 # Update future actions in the observation queues
+                t_update_actions = _time_start(device)
                 for idx in range(len(pred_actions[0])):
                     observation = {'action': pred_actions[0][idx:idx + 1]}
                     observation['action'][:, ori_action_dim:] = 0.0
                     cond_obs_queues = populate_queues(cond_obs_queues,
                                                       observation)
+                _time_end(device, f"wma/update_actions/itr{itr}", t_update_actions)
 
                 # Collect data for interacting the world-model using the predicted actions
+                t_obs_wm = _time_start(device)
                 observation = {
                     'observation.images.top':
                     torch.stack(list(
@@ -612,9 +680,11 @@ def run_inference(args: argparse.Namespace, gpu_num: int, gpu_no: int) -> None:
                     key: observation[key].to(device, non_blocking=True)
                     for key in observation
                 }
+                _time_end(device, f"wma/obs_wm/itr{itr}", t_obs_wm)
 
                 # Interaction with the world-model
                 print(f'>>> Step {itr}: interacting with world model ...')
+                t_wm = _time_start(device)
                 pred_videos_1, _, pred_states = image_guided_synthesis_sim_mode(
                     model,
                     "",
@@ -629,7 +699,9 @@ def run_inference(args: argparse.Namespace, gpu_num: int, gpu_no: int) -> None:
                     text_input=False,
                     timestep_spacing=args.timestep_spacing,
                     guidance_rescale=args.guidance_rescale)
+                _time_end(device, f"wma/wm_interact/itr{itr}", t_wm)
 
+                t_update_states = _time_start(device)
                 for idx in range(args.exe_steps):
                     observation = {
                         'observation.images.top':
@@ -643,8 +715,10 @@ def run_inference(args: argparse.Namespace, gpu_num: int, gpu_no: int) -> None:
                     observation['observation.state'][:, ori_state_dim:] = 0.0
                     cond_obs_queues = populate_queues(cond_obs_queues,
                                                       observation)
+                _time_end(device, f"wma/update_states/itr{itr}", t_update_states)
 
                 # Save the imagen videos for decision-making
+                t_tb = _time_start(device)
                 sample_tag = f"{args.dataset}-vid{sample['videoid']}-dm-fs-{fs}/itr-{itr}"
                 log_to_tensorboard(writer,
                                    pred_videos_0,
@@ -656,8 +730,10 @@ def run_inference(args: argparse.Namespace, gpu_num: int, gpu_no: int) -> None:
                                    pred_videos_1,
                                    sample_tag,
                                    fps=args.save_fps)
+                _time_end(device, f"wma/tensorboard/itr{itr}", t_tb)
 
                 # Save the imagen videos for decision-making
+                t_save = _time_start(device)
                 sample_video_file = f'{video_save_dir}/dm/{fs}/itr-{itr}.mp4'
                 save_results(pred_videos_0.cpu(),
                              sample_video_file,
@@ -667,10 +743,12 @@ def run_inference(args: argparse.Namespace, gpu_num: int, gpu_no: int) -> None:
                 save_results(pred_videos_1.cpu(),
                              sample_video_file,
                              fps=args.save_fps)
+                _time_end(device, f"wma/save_videos/itr{itr}", t_save)
 
                 print('>' * 24)
                 # Collect the result of world-model interactions
                 wm_video.append(pred_videos_1[:, :, :args.exe_steps].cpu())
+                _time_end(device, f"wma/iter_total/itr{itr}", t_iter)
 
             full_video = torch.cat(wm_video, dim=2)
             sample_tag = f"{args.dataset}-vid{sample['videoid']}-wd-fs-{fs}/full"
