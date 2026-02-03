@@ -8,6 +8,7 @@
 # thanks!
 
 import torch.nn as nn
+import torch.nn.functional as F
 from unifolm_wma.utils.utils import instantiate_from_config
 
 
@@ -78,7 +79,7 @@ def nonlinearity(type='silu'):
 class GroupNormSpecific(nn.GroupNorm):
 
     def forward(self, x):
-        return super().forward(x.float()).type(x.dtype)
+        return F.group_norm(x.float(), self.num_groups, self.weight.float() if self.weight is not None else None, self.bias.float() if self.bias is not None else None, self.eps).type(x.dtype)
 
 
 def normalization(channels, num_groups=32):

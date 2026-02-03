@@ -467,6 +467,7 @@ def image_guided_synthesis_sim_mode(
             fs=fs,
             timestep_spacing=timestep_spacing,
             guidance_rescale=guidance_rescale,
+            precision=16,
             **kwargs)
 
         _time_end(device, "wma/ddim_sample", t_sample)
@@ -529,6 +530,13 @@ def run_inference(args: argparse.Namespace, gpu_num: int, gpu_no: int) -> None:
     t_cuda = _time_start(None)
     model = model.cuda(gpu_no)
     device = get_device_from_parameters(model)
+    # Convert model to FP16 for faster inference
+    t_fp16 = _time_start(device)
+    model = model.half()
+    # Also update internal dtype for diffusion_model
+    model.model.diffusion_model.dtype = torch.float16
+    _time_end(device, "wma/model_to_fp16", t_fp16)
+    print(">>> Model converted to FP16")
     _time_end(device, "wma/model_to_cuda", t_cuda)
 
     # Run over data
@@ -605,7 +613,7 @@ def run_inference(args: argparse.Namespace, gpu_num: int, gpu_no: int) -> None:
                 torch.zeros_like(batch['action'][-1]).unsqueeze(0)
             }
             observation = {
-                key: observation[key].to(device, non_blocking=True)
+                key: observation[key].to(device, dtype=torch.float16, non_blocking=True)
                 for key in observation
             }
             # Update observation queues
@@ -630,7 +638,7 @@ def run_inference(args: argparse.Namespace, gpu_num: int, gpu_no: int) -> None:
                     torch.stack(list(cond_obs_queues['action']), dim=1),
                 }
                 observation = {
-                    key: observation[key].to(device, non_blocking=True)
+                    key: observation[key].to(device, dtype=torch.float16, non_blocking=True)
                     for key in observation
                 }
                 _time_end(device, f"wma/obs_policy/itr{itr}", t_obs_policy)
@@ -677,7 +685,7 @@ def run_inference(args: argparse.Namespace, gpu_num: int, gpu_no: int) -> None:
                     torch.stack(list(cond_obs_queues['action']), dim=1),
                 }
                 observation = {
-                    key: observation[key].to(device, non_blocking=True)
+                    key: observation[key].to(device, dtype=torch.float16, non_blocking=True)
                     for key in observation
                 }
                 _time_end(device, f"wma/obs_wm/itr{itr}", t_obs_wm)

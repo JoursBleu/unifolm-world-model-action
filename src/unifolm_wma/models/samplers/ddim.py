@@ -236,6 +236,13 @@ class DDIMSampler(object):
                 img = img.to(dtype=torch.float16)
                 action = action.to(dtype=torch.float16)
                 state = state.to(dtype=torch.float16)
+                # Also convert cond to FP16
+                if isinstance(cond, dict):
+                    for key in cond:
+                        if isinstance(cond[key], list):
+                            cond[key] = [c.to(dtype=torch.float16) if isinstance(c, torch.Tensor) and c.is_floating_point() else c for c in cond[key]]
+                        elif isinstance(cond[key], torch.Tensor) and cond[key].is_floating_point():
+                            cond[key] = cond[key].to(dtype=torch.float16)
 
         if timesteps is None:
             timesteps = self.ddpm_num_timesteps if ddim_use_original_steps else self.ddim_timesteps
@@ -354,6 +361,7 @@ class DDIMSampler(object):
                       guidance_rescale=0.0,
                       **kwargs):
         b, *_, device = *x.shape, x.device
+        input_dtype = x.dtype  # Save input dtype for FP16 support
         if x.dim() == 5:
             is_video = True
         else:
@@ -449,7 +457,7 @@ class DDIMSampler(object):
         x_prev = a_prev.sqrt() * pred_x0 + dir_xt + noise
         self._post_process_elapsed = _time_elapsed(device, t_post)
 
-        return x_prev, pred_x0, model_output_action, model_output_state
+        return x_prev.to(input_dtype), pred_x0.to(input_dtype), model_output_action, model_output_state
 
     @torch.no_grad()
     def decode(self,

@@ -8,6 +8,7 @@ https://github.com/CompVis/taming-transformers
 
 import random
 import torch
+# from torch.amp import autocast  # Removed for manual FP16
 import torch.nn as nn
 import copy
 import numpy as np
@@ -1239,6 +1240,7 @@ class LatentDiffusion(DDPM):
 
         return loss, loss_dict
 
+    # @torch.autocast removed - using manual FP16 conversion
     def apply_model(self, x_noisy: Tensor, x_action_noisy: Tensor,
                     x_state_noisy: Tensor, t: Tensor, cond: Any,
                     **kwargs: Any) -> Tensor | tuple[Tensor, Tensor, Tensor]:
