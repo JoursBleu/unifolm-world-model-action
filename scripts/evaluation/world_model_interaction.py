@@ -40,6 +40,7 @@ def _time_start(device: torch.device | None) -> float:
 
 
 def _time_end(device: torch.device | None, label: str, start_time: float) -> None:
+    return  # Timing disabled
     _sync_device(device)
     elapsed = time.time() - start_time
     print(f'[TIME] {label}: {elapsed:.4f}s')
