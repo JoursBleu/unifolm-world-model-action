@@ -61,98 +61,9 @@ seed: 123
 | **Temporal Attention** | 1.33s | 0.084s | 0.097s |
 | **Other** | 0.19s | 0.015s | 0.011s |
 
-### 2.3 Input Blocks 详细 (b0-b11)
-
-| Block | FP32 时间 | FP16 时间 | 4090 FP16 | 说明 |
-|-------|-----------|-----------|-----------|------|
-| b0 | 0.18s | 0.013s | 0.013s | 入口卷积 |
-| b1 | 0.33s | 0.027s | 0.036s | ResBlock + Attention |
-| b2 | 0.33s | 0.027s | 0.036s | ResBlock + Attention |
-| b3 | 0.008s | 0.001s | 0.001s | Downsample |
-| b4 | 0.22s | 0.015s | 0.018s | ResBlock + Attention |
-| b5 | 0.24s | 0.015s | 0.018s | ResBlock + Attention |
-| b6 | 0.006s | 0.001s | 0.000s | Downsample |
-| b7 | 0.24s | 0.011s | 0.014s | ResBlock + Attention |
-| b8 | 0.26s | 0.012s | 0.014s | ResBlock + Attention |
-| b9 | 0.008s | 0.001s | 0.001s | Downsample |
-| b10 | 0.02s | 0.003s | 0.002s | ResBlock |
-| b11 | 0.02s | 0.003s | 0.002s | ResBlock |
-
-### 2.4 Output Blocks 详细 (b0-b11)
-
-| Block | FP32 时间 | FP16 时间 | 4090 FP16 | 说明 |
-|-------|-----------|-----------|-----------|------|
-| b0 | 0.03s | 0.005s | 0.002s | ResBlock |
-| b1 | 0.03s | 0.004s | 0.002s | ResBlock |
-| b2 | 0.06s | 0.006s | 0.003s | ResBlock + Upsample |
-| b3 | 0.30s | 0.014s | 0.015s | ResBlock + Attention |
-| b4 | 0.30s | 0.014s | 0.015s | ResBlock + Attention |
-| b5 | 0.35s | 0.019s | 0.018s | ResBlock + Attention + Upsample |
-| b6 | 0.31s | 0.019s | 0.019s | ResBlock + Attention |
-| b7 | 0.27s | 0.018s | 0.018s | ResBlock + Attention |
-| b8 | 0.32s | 0.021s | 0.021s | ResBlock + Attention + Upsample |
-| b9 | 0.41s | 0.032s | 0.035s | ResBlock + Attention |
-| b10 | 0.37s | 0.030s | 0.033s | ResBlock + Attention |
-| b11 | 0.37s | 0.030s | 0.033s | ResBlock + Attention |
-
 ---
 
-## 3. 算子级别分解
-
-### 3.1 ResBlock 内部算子
-
-| 算子 | FP32 时间 | FP16 时间 | 4090 FP16 |
-|------|-----------|-----------|-----------|
-| **in_layers** (norm+act+conv) | 0.84s | 0.056s | 0.035s |
-| **temporal_conv** | 0.66s | 0.059s | 0.044s |
-| **out_layers** (norm+act+conv) | 0.52s | 0.035s | 0.022s |
-| **skip_conn** | 0.07s | 0.005s | 0.005s |
-| **emb_layers** | 0.003s | 0.001s | 0.001s |
-
-### 3.2 Spatial Attention 内部算子
-
-| 算子 | FP32 时间 | FP16 时间 | 4090 FP16 |
-|------|-----------|-----------|-----------|
-| **attn_blocks** | 1.35s | 0.083s | 0.147s |
-| **proj_in** | 0.06s | 0.003s | 0.004s |
-| **proj_out** | 0.05s | 0.004s | 0.004s |
-| **norm** | 0.003s | 0.002s | 0.001s |
-
-### 3.3 Temporal Attention 内部算子
-
-| 算子 | FP32 时间 | FP16 时间 | 4090 FP16 |
-|------|-----------|-----------|-----------|
-| **attn_blocks** | 1.20s | 0.063s | 0.080s |
-| **proj_in** | 0.06s | 0.007s | 0.006s |
-| **proj_out** | 0.06s | 0.008s | 0.005s |
-| **norm** | 0.005s | 0.004s | 0.003s |
-
-### 3.4 Attention Block 内部算子
-
-| 算子 | FP32 时间 | FP16 时间 | 4090 FP16 |
-|------|-----------|-----------|-----------|
-| **ff** (FeedForward) | 1.30s | 0.061s | 0.074s |
-| **self_attn** | 0.70s | 0.043s | 0.072s |
-| **cross_attn** | 0.54s | 0.040s | 0.079s |
-
-### 3.5 Cross Attention 内部算子
-
-| 算子 | FP32 时间 | FP16 时间 | 4090 FP16 |
-|------|-----------|-----------|-----------|
-| **to_qkv** (Q/K/V 投影) | 0.66s | 0.023s | 0.015s |
-| **sdpa** (注意力计算) | 0.32s | 0.032s | 0.013s |
-| **to_out** (输出投影) | 0.22s | 0.009s | 0.006s |
-
-### 3.6 FeedForward 内部算子
-
-| 算子 | FP32 时间 | FP16 时间 | 4090 FP16 |
-|------|-----------|-----------|-----------|
-| **geglu** | 0.86s | 0.041s | 0.051s |
-| **linear_out** | 0.44s | 0.012s | 0.018s |
-
----
-
-## 4. Action/State UNet 性能
+## 3. Action/State UNet 性能
 
 | 模块 | FP32 时间/step | FP16 时间/step | 4090 FP16 |
 |------|---------------|----------------|-----------|
@@ -161,7 +72,7 @@ seed: 123
 
 ---
 
-## 5. 精度验证 (FP16 vs FP32)
+## 4. 精度验证 (FP16 vs FP32)
 
 | 指标 | 值 | 说明 |
 |------|-----|------|
@@ -172,7 +83,7 @@ seed: 123
 
 ---
 
-## 6. 性能总结
+## 5. 性能总结
 
 | 指标 | RX 9070 XT FP32 | RX 9070 XT FP16 | RTX 4090 FP16 |
 |------|-----------------|-----------------|---------------|
@@ -182,14 +93,6 @@ seed: 123
 | **精度损失 (PSNR)** | - | 47.88 dB | - |
 
 > **结论**: RX 9070 XT FP16 比 FP32 快 **12.2x**，RTX 4090 比 9070 XT FP16 快 **1.8x**
-
-### 每 DDIM Step 性能对比
-
-| 模块 | FP32 | FP16 | 4090 FP16 | FP32→FP16 加速 |
-|------|------|------|-----------|----------------|
-| **Video UNet** | 5.07s | 0.354s | 0.377s | 14.3x |
-| **Action UNet** | 0.143s | 0.035s | 0.012s | 4.1x |
-| **State UNet** | 0.143s | 0.035s | 0.012s | 4.1x |
 
 ### 瓶颈分析
 
@@ -212,7 +115,7 @@ seed: 123
 
 ---
 
-## 7. 优化建议
+## 6. 优化建议
 
 ### 已实施优化
 - [x] FP16 手动转换 (model.half())
@@ -225,6 +128,99 @@ seed: 123
 - [ ] 模型量化 (INT8/INT4)
 - [ ] Torch Compile 优化
 - [ ] 批处理优化（增加 batch size）
+
+---
+
+## 附录 A: Input/Output Blocks 详细数据
+
+### A.1 Input Blocks 详细 (b0-b11)
+
+| Block | FP32 时间 | FP16 时间 | 4090 FP16 | 说明 |
+|-------|-----------|-----------|-----------|------|
+| b0 | 0.18s | 0.013s | 0.013s | 入口卷积 |
+| b1 | 0.33s | 0.027s | 0.036s | ResBlock + Attention |
+| b2 | 0.33s | 0.027s | 0.036s | ResBlock + Attention |
+| b3 | 0.008s | 0.001s | 0.001s | Downsample |
+| b4 | 0.22s | 0.015s | 0.018s | ResBlock + Attention |
+| b5 | 0.24s | 0.015s | 0.018s | ResBlock + Attention |
+| b6 | 0.006s | 0.001s | 0.000s | Downsample |
+| b7 | 0.24s | 0.011s | 0.014s | ResBlock + Attention |
+| b8 | 0.26s | 0.012s | 0.014s | ResBlock + Attention |
+| b9 | 0.008s | 0.001s | 0.001s | Downsample |
+| b10 | 0.02s | 0.003s | 0.002s | ResBlock |
+| b11 | 0.02s | 0.003s | 0.002s | ResBlock |
+
+### A.2 Output Blocks 详细 (b0-b11)
+
+| Block | FP32 时间 | FP16 时间 | 4090 FP16 | 说明 |
+|-------|-----------|-----------|-----------|------|
+| b0 | 0.03s | 0.005s | 0.002s | ResBlock |
+| b1 | 0.03s | 0.004s | 0.002s | ResBlock |
+| b2 | 0.06s | 0.006s | 0.003s | ResBlock + Upsample |
+| b3 | 0.30s | 0.014s | 0.015s | ResBlock + Attention |
+| b4 | 0.30s | 0.014s | 0.015s | ResBlock + Attention |
+| b5 | 0.35s | 0.019s | 0.018s | ResBlock + Attention + Upsample |
+| b6 | 0.31s | 0.019s | 0.019s | ResBlock + Attention |
+| b7 | 0.27s | 0.018s | 0.018s | ResBlock + Attention |
+| b8 | 0.32s | 0.021s | 0.021s | ResBlock + Attention + Upsample |
+| b9 | 0.41s | 0.032s | 0.035s | ResBlock + Attention |
+| b10 | 0.37s | 0.030s | 0.033s | ResBlock + Attention |
+| b11 | 0.37s | 0.030s | 0.033s | ResBlock + Attention |
+
+---
+
+## 附录 B: 算子级别分解
+
+### B.1 ResBlock 内部算子
+
+| 算子 | FP32 时间 | FP16 时间 | 4090 FP16 |
+|------|-----------|-----------|-----------|
+| **in_layers** (norm+act+conv) | 0.84s | 0.056s | 0.035s |
+| **temporal_conv** | 0.66s | 0.059s | 0.044s |
+| **out_layers** (norm+act+conv) | 0.52s | 0.035s | 0.022s |
+| **skip_conn** | 0.07s | 0.005s | 0.005s |
+| **emb_layers** | 0.003s | 0.001s | 0.001s |
+
+### B.2 Spatial Attention 内部算子
+
+| 算子 | FP32 时间 | FP16 时间 | 4090 FP16 |
+|------|-----------|-----------|-----------|
+| **attn_blocks** | 1.35s | 0.083s | 0.147s |
+| **proj_in** | 0.06s | 0.003s | 0.004s |
+| **proj_out** | 0.05s | 0.004s | 0.004s |
+| **norm** | 0.003s | 0.002s | 0.001s |
+
+### B.3 Temporal Attention 内部算子
+
+| 算子 | FP32 时间 | FP16 时间 | 4090 FP16 |
+|------|-----------|-----------|-----------|
+| **attn_blocks** | 1.20s | 0.063s | 0.080s |
+| **proj_in** | 0.06s | 0.007s | 0.006s |
+| **proj_out** | 0.06s | 0.008s | 0.005s |
+| **norm** | 0.005s | 0.004s | 0.003s |
+
+### B.4 Attention Block 内部算子
+
+| 算子 | FP32 时间 | FP16 时间 | 4090 FP16 |
+|------|-----------|-----------|-----------|
+| **ff** (FeedForward) | 1.30s | 0.061s | 0.074s |
+| **self_attn** | 0.70s | 0.043s | 0.072s |
+| **cross_attn** | 0.54s | 0.040s | 0.079s |
+
+### B.5 Cross Attention 内部算子
+
+| 算子 | FP32 时间 | FP16 时间 | 4090 FP16 |
+|------|-----------|-----------|-----------|
+| **to_qkv** (Q/K/V 投影) | 0.66s | 0.023s | 0.015s |
+| **sdpa** (注意力计算) | 0.32s | 0.032s | 0.013s |
+| **to_out** (输出投影) | 0.22s | 0.009s | 0.006s |
+
+### B.6 FeedForward 内部算子
+
+| 算子 | FP32 时间 | FP16 时间 | 4090 FP16 |
+|------|-----------|-----------|-----------|
+| **geglu** | 0.86s | 0.041s | 0.051s |
+| **linear_out** | 0.44s | 0.012s | 0.018s |
 
 ---
 
